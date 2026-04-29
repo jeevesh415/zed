@@ -415,6 +415,7 @@ pub fn apply_diff_to_string_with_hunk_offset(
 
     let mut text = text.to_string();
     let mut first_hunk_offset = None;
+    let mut line_delta = 0i64;
 
     while let Some(event) = diff.next().context("Failed to parse diff")? {
         match event {
@@ -424,9 +425,12 @@ pub fn apply_diff_to_string_with_hunk_offset(
                 status: _,
             } => {
                 let candidates = find_context_candidates(&text, &mut hunk);
+                let adjusted_start_line = hunk
+                    .start_line
+                    .and_then(|start_line| u32::try_from(i64::from(start_line) + line_delta).ok());
 
                 let hunk_offset =
-                    disambiguate_by_line_number(&candidates, hunk.start_line, &|offset| {
+                    disambiguate_by_line_number(&candidates, adjusted_start_line, &|offset| {
                         text[..offset].matches('\n').count() as u32
                     })
                     .ok_or_else(|| anyhow!("couldn't resolve hunk"))?;
@@ -435,16 +439,36 @@ pub fn apply_diff_to_string_with_hunk_offset(
                     first_hunk_offset = Some(hunk_offset);
                 }
 
+                let hunk_line_delta = hunk_line_delta(&hunk);
                 for edit in hunk.edits.iter().rev() {
                     let range = (hunk_offset + edit.range.start)..(hunk_offset + edit.range.end);
                     text.replace_range(range, &edit.text);
                 }
+                line_delta += hunk_line_delta;
             }
-            DiffEvent::FileEnd { .. } => {}
+            DiffEvent::FileEnd { .. } => {
+                line_delta = 0;
+            }
         }
     }
 
     Ok((text, first_hunk_offset))
+}
+
+fn hunk_line_delta(hunk: &Hunk) -> i64 {
+    hunk.edits
+        .iter()
+        .map(|edit| {
+            let deleted_line_count = hunk
+                .context
+                .bytes()
+                .skip(edit.range.start)
+                .take(edit.range.end.saturating_sub(edit.range.start))
+                .filter(|&byte| byte == b'\n')
+                .count();
+            edit.text.matches('\n').count() as i64 - deleted_line_count as i64
+        })
+        .sum()
 }
 
 struct PatchFile<'a> {
@@ -1313,6 +1337,26 @@ mod tests {
 
         let result = apply_diff_to_string(diff, text).unwrap();
         assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn test_apply_diff_to_string_adjusts_line_numbers_after_prior_hunks() {
+        let text = "first\nremove first\nfirst\nsame\nremove\nsame\nsame\nremove\nsame\n";
+        let diff = indoc! {"
+            --- a/file.txt
+            +++ b/file.txt
+            @@ -1,3 +1,2 @@
+             first
+            -remove first
+             first
+            @@ -4,3 +3,2 @@
+             same
+            -remove
+             same
+        "};
+
+        let result = apply_diff_to_string(diff, text).unwrap();
+        assert_eq!(result, "first\nfirst\nsame\nsame\nsame\nremove\nsame\n");
     }
 
     #[test]
